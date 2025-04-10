@@ -1,0 +1,235 @@
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+import threading
+import requests
+from pushbullet import Pushbullet
+from w1thermsensor import W1ThermSensor
+
+# Your API keys
+PUSHBULLET_API_KEY = 'o.vjZ5qxQZQUeoVcHjkrT1nhRYTwkZ7pvk'
+WEATHER_API_KEY = '42db11405c74755e9a2f8b6fd62d6b2f'
+
+def get_weather(api_key, lat, lon):
+    url = f'http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}'
+    response = requests.get(url)
+    if response.status_code == 200:
+        weather_data = response.json()
+        return weather_data
+    else:
+        print(f'Error: {response.status_code}')
+        return None
+
+def kelvin_to_celsius(kelvin):
+    return kelvin - 273.15
+
+def send_notification(api_key, title, message):
+    try:
+        pb = Pushbullet(api_key)
+        pb.push_note(title, message)
+        print('Notification sent successfully')
+    except Exception as e:
+        print(f'Failed to send notification: {e}')
+
+def read_gps_data():
+    lat = 8.135420132472134 
+    lon = 77.56407851848138
+    weather_data = get_weather(WEATHER_API_KEY, lat, lon)
+    if weather_data:
+        temperature_kelvin = weather_data['main']['temp']
+        temperature_celsius = kelvin_to_celsius(temperature_kelvin)
+        humidity = weather_data['main']['humidity']
+
+        message = (f'Latitude: {lat}, Longitude: {lon}\n'
+                    f'Weather in your specified area:\n'
+                    f'Temperature: {temperature_celsius:.2f} °C\n'
+                    f'Humidity: {humidity}%')
+        
+        print(message)
+        send_notification(PUSHBULLET_API_KEY, 'Weather Update', message)
+    else:
+        error_message = 'Failed to retrieve weather data.'
+        print(error_message)
+        send_notification(PUSHBULLET_API_KEY, 'Weather Update Error', error_message)
+
+# Run the main function
+read_gps_data()
+
+
+# Set up GPIO mode and pins
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+
+# Motor GPIO pins
+MOTOR1_IN1 = 17
+MOTOR1_IN2 = 18
+MOTOR2_IN3 = 22
+MOTOR2_IN4 = 23
+
+GPIO.setup(MOTOR1_IN1, GPIO.OUT)
+GPIO.setup(MOTOR1_IN2, GPIO.OUT)
+GPIO.setup(MOTOR2_IN3, GPIO.OUT)
+GPIO.setup(MOTOR2_IN4, GPIO.OUT)
+
+# IR sensor pins
+IR_LEFT_PIN = 20
+IR_RIGHT_PIN = 26
+GPIO.setup(IR_LEFT_PIN, GPIO.IN)
+GPIO.setup(IR_RIGHT_PIN, GPIO.IN)
+
+# Shared variables for obstacle detection
+obstacle_left_detected = False
+obstacle_right_detected = False
+
+# Define motor control functions
+def stop():
+    GPIO.output(MOTOR1_IN1, GPIO.LOW)
+    GPIO.output(MOTOR1_IN2, GPIO.LOW)
+    GPIO.output(MOTOR2_IN3, GPIO.LOW)
+    GPIO.output(MOTOR2_IN4, GPIO.LOW)
+    print("Motors stopped")
+
+def move_forward():
+    GPIO.output(MOTOR1_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR1_IN2, GPIO.LOW)
+    GPIO.output(MOTOR2_IN3, GPIO.HIGH)
+    GPIO.output(MOTOR2_IN4, GPIO.LOW)
+    print("Moving forward")
+
+def move_backward():
+    GPIO.output(MOTOR1_IN1, GPIO.LOW)
+    GPIO.output(MOTOR1_IN2, GPIO.HIGH)
+    GPIO.output(MOTOR2_IN3, GPIO.LOW)
+    GPIO.output(MOTOR2_IN4, GPIO.HIGH)
+    print("Moving backward")
+
+def turn_left():
+    GPIO.output(MOTOR1_IN1, GPIO.LOW)
+    GPIO.output(MOTOR1_IN2, GPIO.HIGH)
+    GPIO.output(MOTOR2_IN3, GPIO.HIGH)
+    GPIO.output(MOTOR2_IN4, GPIO.LOW)
+    print("Turning left")
+
+def turn_right():
+    GPIO.output(MOTOR1_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR1_IN2, GPIO.LOW)
+    GPIO.output(MOTOR2_IN3, GPIO.LOW)
+    GPIO.output(MOTOR2_IN4, GPIO.HIGH)
+    print("Turning right")
+
+# Load Haar Cascade model
+waste_cascade = cv2.CascadeClassifier('/home/rcet/Downloads/h3/classifier/cascade.xml')
+
+# Initialize video capture from the Pi camera (assuming it's connected as '/dev/video0')
+cap = cv2.VideoCapture(0)
+
+# Define left and right lines for turning with increased space
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+space_between_lines = 30  # Adjust as needed
+line_left = frame_width // 3 - space_between_lines
+line_right = frame_width * 2 // 3 + space_between_lines
+
+# PID parameters
+Kp = 0.1  # Proportional control gain
+
+# IR sensor detection thread
+def ir_sensor_detection():
+    global obstacle_left_detected, obstacle_right_detected
+    while True:
+        obstacle_left_detected = GPIO.input(IR_LEFT_PIN)
+        obstacle_right_detected = GPIO.input(IR_RIGHT_PIN)
+        time.sleep(5)  # Polling interval for IR sensors
+
+# Start the IR sensor detection thread
+ir_thread = threading.Thread(target=ir_sensor_detection)
+ir_thread.daemon = True
+ir_thread.start()
+
+# Main loop
+try:
+    last_detection_position = None
+    while True:
+        # Capture frame-by-frame
+        ret, frame = cap.read()
+        
+        if not ret:
+            break
+
+        # Convert frame to grayscale for Haar Cascade
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect objects using Haar Cascade
+        objects = waste_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        
+        cv2.line(frame, (line_left, 0), (line_left, frame.shape[0]), (0, 255, 0), 2)
+        cv2.line(frame, (line_right, 0), (line_right, frame.shape[0]), (0, 255, 0), 2)
+        
+        waste_detected = False
+        for (x, y, w, h) in objects:
+            waste_detected = True
+            # Draw rectangle around detected objects
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+            
+            # Calculate the center of the waste object bounding box
+            waste_center_x = x + w // 2
+                
+            # Move robot based on waste position
+            if line_left < waste_center_x < line_right:
+                print("Move forward")
+                move_forward()
+                last_detection_position = 'forward'
+            else:
+                # Adjust orientation using proportional control
+                error = frame_width // 2 - waste_center_x
+                turn_rate = Kp * error
+                if turn_rate > 0:
+                    print("Turn right")
+                    turn_right()
+                    last_detection_position = 'right'
+                else:
+                    print("Turn left")
+                    turn_left()
+                    last_detection_position = 'left'
+        
+        if not waste_detected:
+            # Stop if no objects detected
+            print("No objects detected")
+            stop()
+            time.sleep(2)
+        
+        # Display the resulting frame
+        cv2.imshow('Frame', frame)
+
+        # Check IR sensor flags
+        if not obstacle_left_detected:
+            print("Left IR sensor detected an obstacle")
+            move_backward()
+            time.sleep(5)  # Reverse for 0.5 seconds
+            turn_right()
+            time.sleep(5)  # Turn right for 0.5 seconds
+            stop()
+            obstacle_left_detected = False
+
+        elif not obstacle_right_detected:
+            print("Right IR sensor detected an obstacle")
+            move_backward()
+            time.sleep(5)  # Reverse for 0.5 seconds
+            turn_left()
+            time.sleep(5)  # Turn left for 0.5 seconds
+            stop()
+            obstacle_right_detected = False
+
+        # Break the loop if 'q' is pressed
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+finally:
+    # Release the capture
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    # Stop motors and cleanup GPIO pins
+    stop()
+    GPIO.cleanup()
+
