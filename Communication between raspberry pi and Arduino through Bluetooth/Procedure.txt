@@ -1,0 +1,21 @@
+First communicate Arduino with Bluetooth through program hc-05 will be on for communicate
+
+second communicate raspberry pi and Arduino through command line with Bluetooth
+
+the commands are 
+
+sudo bluetoothctl (for open the bluetooth)
+
+agent on (to start the agent)
+
+scan on (to scan the device)
+
+copy the mac address of Bluetooth HC-05
+
+pair (mac address)
+
+connect (mac address)
+
+use
+
+sudo rfcomm bind 7 (mac-address of the device)
